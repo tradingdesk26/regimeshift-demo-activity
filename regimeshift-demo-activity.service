@@ -1,0 +1,24 @@
+[Unit]
+Description=RegimeShift demo activity bot — single fire (lender/borrower/paired/repay)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=dz
+Group=dz
+WorkingDirectory=/opt/regimeshift-demo
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/regimeshift-demo/venv/bin/python /opt/regimeshift-demo/activity.py
+StandardOutput=append:/opt/regimeshift-demo/activity.log
+StandardError=append:/opt/regimeshift-demo/activity.log
+TimeoutStartSec=300
+
+# Sandboxing — least privilege
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/opt/regimeshift-demo
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

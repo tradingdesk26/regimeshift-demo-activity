@@ -1,0 +1,14 @@
+[Unit]
+Description=Fires the demo activity bot every 5-15 min (with random jitter)
+
+[Timer]
+# First fire: 2 min after boot (gives services time to settle)
+OnBootSec=2min
+# Subsequent fires: every 7 minutes ± up to 8 min jitter → effective range 7-15 min
+OnUnitInactiveSec=7min
+RandomizedDelaySec=8min
+Unit=regimeshift-demo-activity.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target
