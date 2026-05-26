@@ -23,7 +23,7 @@ distinct economic roles:
 
 | Wallet | Role | What it does | Excluded from |
 |---|---|---|---|
-| **D** | Data buyer | Pays $0.10 USDC via x402 to `GET /v1/rate/sofr/usd` every ≥90 min; caches the answer for B + C to read | Lend/borrow pool |
+| **D** | Data buyer | Pays $0.001 USDC via x402 to `GET /v1/rate/sofr/usd` every ≥90 min; caches the answer for B + C to read | Lend/borrow pool |
 | **B** | Executor | Reads cached SOFR; posts lender + borrower intents at `base + regime + take + spread`; originates loans; repays | — |
 | **C** | Executor | Same as B (so paired matches run between two real on-chain identities) | — |
 
