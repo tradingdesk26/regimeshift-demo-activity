@@ -5,7 +5,7 @@ Agent-SOFR via x402 like any third-party agent would.
 
 Role separation (option C from design discussion):
   Wallet A  — oracle signer (OFF-LIMITS to this script)
-  Wallet D  — "data buyer" agent. Periodically pays $0.10 via x402 to fetch
+  Wallet D  — "data buyer" agent. Periodically pays $0.001 via x402 to fetch
               fresh Agent-SOFR USD rate, caches it on disk. Excluded from
               lender/borrower pools.
   Wallets B + C — "executor" agents. Read cached SOFR, post intents using
@@ -715,7 +715,7 @@ def main() -> int:
         role = "data-buyer" if w.name == DATA_BUYER_NAME else ("executor" if w.name in EXECUTOR_NAMES else "?")
         log(f"  {w.name} ({role}) {w.addr[:8]}…  ETH={b['eth']:.5f}  USDC=${b['usdc']:.3f}  WETH={b['weth']:.5f}")
 
-    # First: refresh Agent-SOFR cache if stale (D pays $0.10 via x402)
+    # First: refresh Agent-SOFR cache if stale (D pays $0.001 via x402)
     try:
         refresh_sofr_if_stale(wallets, chain)
     except Exception as e:
