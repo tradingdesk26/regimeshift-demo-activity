@@ -1,6 +1,6 @@
 requests>=2.31.0
 web3>=6.20.0
 eth-account>=0.11.0
-# Official x402 protocol SDK — bot uses it to pay $0.10 USDC for Agent-SOFR
+# Official x402 protocol SDK — bot uses it to pay $0.001 USDC for Agent-SOFR
 # rate fetches, demonstrating end-to-end agent-economy flow on every fire
 x402>=2.10.0

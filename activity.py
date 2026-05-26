@@ -47,7 +47,7 @@ STATE_PATH      = "/opt/regimeshift-demo/state.json"
 SOFR_CACHE_PATH = "/opt/regimeshift-demo/sofr_cache.json"
 WALLETS_ENV     = "/opt/regimeshift-demo/.wallets.env"
 
-# Refresh SOFR cache after 90 min — keeps D's $0.10/call spend at ~$1.60/day
+# Refresh SOFR cache after 90 min — at $0.001/call ≈ $0.016/day (was $1.60/day at $0.10)
 SOFR_REFRESH_AGE_SEC = 5400
 DATA_BUYER_NAME      = "D"
 EXECUTOR_NAMES       = {"B", "C"}   # only these participate in lend/borrow pools
@@ -228,13 +228,14 @@ class Chain:
 # arms-signals talks to it instead of CDP. Every paid call is a real
 # USDC.transferWithAuthorization tx, visible on BaseScan.
 #
-# Wallet D pays $0.10 USDC for fresh Agent-SOFR every SOFR_REFRESH_AGE_SEC.
+# Wallet D pays $0.001 USDC for fresh Agent-SOFR every SOFR_REFRESH_AGE_SEC
+# (was $0.10 — lowered to $0.001 in 2026-05-26 to reduce friction for new agents).
 # If the paid x402 call fails for any reason, fall back to reading the most
 # recent signed quote from /v1/matches/recent (same data, free path) so the
 # bot never blocks on x402 hiccups.
 
 def x402_get_sofr(account) -> dict:
-    """Pay $0.10 USDC via x402 to fetch fresh Agent-SOFR. Uses the official
+    """Pay $0.001 USDC via x402 to fetch fresh Agent-SOFR. Uses the official
     x402 SDK 2.10 client wrapper on a requests.Session — server-side our
     own facilitator (not CDP) handles verify + settle on Base mainnet."""
     from x402 import x402ClientSync
@@ -324,9 +325,9 @@ def refresh_sofr_if_stale(wallets: list, chain) -> None:
     source = None
     # ── Try PAID x402 path first ────────────────────────────────────────
     bal = chain.balances(d.addr)
-    if bal["usdc"] >= 0.15 and bal["eth"] >= MIN_ETH_GAS:
+    if bal["usdc"] >= 0.005 and bal["eth"] >= MIN_ETH_GAS:
         try:
-            log(f"  paying $0.10 USDC via x402 (D balance: ${bal['usdc']:.3f} USDC, {bal['eth']:.5f} ETH)…")
+            log(f"  paying $0.001 USDC via x402 (D balance: ${bal['usdc']:.4f} USDC, {bal['eth']:.5f} ETH)…")
             paid = x402_get_sofr(d.account)
             data = paid
             source = "x402 paid call (own facilitator → Base mainnet)"
@@ -334,7 +335,7 @@ def refresh_sofr_if_stale(wallets: list, chain) -> None:
         except Exception as e:
             log(f"  ⚠ x402 paid call failed ({type(e).__name__}: {str(e)[:140]}) — falling back to free read")
     else:
-        log(f"  ⚠ D underfunded for paid x402 (need ≥$0.15 USDC + gas) — using free fallback")
+        log(f"  ⚠ D underfunded for paid x402 (need ≥$0.005 USDC + gas) — using free fallback")
 
     # ── Fallback: free read from /matches/recent ────────────────────────
     if data is None:
