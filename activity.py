@@ -66,6 +66,18 @@ P_BORROWER_ONLY = 0.35
 P_PAIRED        = 0.20
 P_REPAY         = 0.10
 
+# ─── D-quoter (lender-of-last-resort against external borrowers) ─────────────
+# When external (non-internal) borrower intents appear in the book, D acts as
+# a lender of last resort: if borrower.max_rate ≥ SOFR floor + D_MIN_SPREAD_BPS,
+# D undercuts the book and posts a lender intent at its own floor, capturing
+# spread = (clearing_rate - SOFR_floor). D is NEVER paired against internal
+# B/C — that would just round-trip USDC across our own wallets.
+D_MIN_SPREAD_BPS    = 20      # D's required spread over SOFR floor
+D_MAX_LOAN_USDC     = 5.0     # don't bet more than $5 of D's capital per loan
+D_RESERVE_USDC      = 2.0     # keep ≥$2 in D for future SOFR refreshes
+D_MAX_DURATION_SEC  = 3600    # don't lock D capital >1h on a single quote
+D_INTENT_TTL_SEC    = 900     # D's lender intent expires after 15 min if unmatched
+
 
 # ─── ABIs ────────────────────────────────────────────────────────────────────
 
@@ -377,15 +389,19 @@ def sofr_floor_bps() -> tuple[int, str]:
 
 # ─── API ─────────────────────────────────────────────────────────────────────
 
-def api_post_lender(wallet: Wallet, amount_usdc: float, min_rate_bps: int, max_duration_sec: int) -> dict:
-    r = requests.post(f"{API_BASE}/v1/intent/lend", timeout=15, json={
+def api_post_lender(wallet: Wallet, amount_usdc: float, min_rate_bps: int, max_duration_sec: int,
+                    expires_at: int | None = None) -> dict:
+    body = {
         "wallet": wallet.addr,
         "asset": "USDC",
         "amount": amount_usdc,
         "max_duration_sec": max_duration_sec,
         "min_rate_bps": min_rate_bps,
         "max_default_prob": 0.001,
-    })
+    }
+    if expires_at is not None:
+        body["expires_at"] = int(expires_at)
+    r = requests.post(f"{API_BASE}/v1/intent/lend", timeout=15, json=body)
     r.raise_for_status()
     return r.json()
 
@@ -417,6 +433,13 @@ def api_active_loans() -> list[dict]:
     r = requests.get(f"{API_BASE}/v1/loans/registry?limit=30", timeout=15)
     r.raise_for_status()
     return [l for l in r.json().get("loans", []) if l["status"] == "active"]
+
+
+def api_open_book() -> dict:
+    """Return {lenders, borrowers} — all currently open intents on both sides."""
+    r = requests.get(f"{API_BASE}/v1/intents/open", timeout=15)
+    r.raise_for_status()
+    return r.json()
 
 
 # ─── Random parameter pickers ────────────────────────────────────────────────
@@ -612,6 +635,110 @@ def act_paired(wallets: list[Wallet], chain: Chain) -> None:
     state_save(state)
 
 
+def act_quoter_d(wallets: list[Wallet], chain: Chain) -> None:
+    """D as lender-of-last-resort against EXTERNAL borrowers.
+
+    Scans the open order book, filters borrower intents whose wallet is NOT
+    internal (B/C/D), and posts a competitive D lender intent if:
+       - borrower.max_rate_bps ≥ SOFR_floor + D_MIN_SPREAD_BPS
+       - principal fits D's capital - reserve
+       - duration ≤ D_MAX_DURATION_SEC
+
+    D posts at SOFR_floor + D_MIN_SPREAD_BPS (its own floor — undercuts other
+    lenders posting at higher rates, but captures D's minimum spread). The
+    matcher pairs at lender's min_rate, so the clearing rate IS D's floor.
+    """
+    d = next((w for w in wallets if w.name == DATA_BUYER_NAME), None)
+    if not d:
+        log("  D-quoter: no D wallet — skip")
+        return
+
+    bal = chain.balances(d.addr)
+    deployable = bal["usdc"] - D_RESERVE_USDC
+    if deployable < 0.5 or bal["eth"] < MIN_ETH_GAS:
+        log(f"  D-quoter: underfunded — usdc=${bal['usdc']:.3f} (need ≥${D_RESERVE_USDC + 0.5}), eth={bal['eth']:.5f}")
+        return
+
+    # Don't compete if D already has an open lender intent
+    try:
+        book = api_open_book()
+    except Exception as e:
+        log(f"  D-quoter: failed to fetch book: {e}")
+        return
+
+    d_open_intents = [l for l in book.get("lenders", []) if l.get("wallet", "").lower() == d.addr.lower()]
+    if d_open_intents:
+        log(f"  D-quoter: already have {len(d_open_intents)} open lender intent(s) — skip")
+        return
+
+    internal = {w.addr.lower() for w in wallets}
+    floor_bps, regime = sofr_floor_bps()
+    d_floor_bps = floor_bps + D_MIN_SPREAD_BPS
+
+    candidates = []
+    for b in book.get("borrowers", []):
+        if b.get("wallet", "").lower() in internal:
+            continue
+        if b.get("principal_asset") != "USDC":
+            continue
+        try:
+            max_rate = int(b.get("max_rate_bps", 0))
+            principal = float(b.get("principal_amount", 0))
+            duration = int(b.get("duration_sec", 0))
+        except (TypeError, ValueError):
+            continue
+        if max_rate < d_floor_bps:
+            continue
+        if principal <= 0 or principal > min(D_MAX_LOAN_USDC, deployable):
+            continue
+        if duration <= 0 or duration > D_MAX_DURATION_SEC:
+            continue
+        candidates.append((max_rate, principal, duration, b))
+
+    if not candidates:
+        log(f"  D-quoter: no external borrower intents above floor ({d_floor_bps}bps incl. {D_MIN_SPREAD_BPS}bp spread)")
+        return
+
+    # Best candidate = highest max_rate (most cushion for D's quote to win)
+    candidates.sort(reverse=True, key=lambda x: x[0])
+    max_rate, principal, duration, target = candidates[0]
+    target_wallet = target.get("wallet", "")[:10]
+
+    log(f"→ D-QUOTE: external borrower {target_wallet}… wants ${principal:.2f} USDC "
+        f"@ ≤{max_rate}bps for {duration}s (regime={regime}, floor={floor_bps}, "
+        f"D quotes at {d_floor_bps}bps = floor+{D_MIN_SPREAD_BPS}bp spread)")
+
+    # Pre-approve USDC for V4 — one-time per wallet, idempotent
+    try:
+        chain.ensure_allowance(d, chain.usdc, int(principal * 1e6))
+    except Exception as e:
+        log(f"  D-quoter: approve failed: {e}")
+        return
+
+    # Post D's lender intent at its floor. TTL short so we don't accumulate
+    # stale D intents in the book if the borrower disappears.
+    try:
+        resp = api_post_lender(
+            d,
+            amount_usdc=principal,
+            min_rate_bps=d_floor_bps,
+            max_duration_sec=duration,
+            expires_at=int(time.time()) + D_INTENT_TTL_SEC,
+        )
+    except Exception as e:
+        log(f"  D-quoter: post failed: {e}")
+        return
+
+    intent_id = resp.get("intent_id", "?")
+    match_id  = resp.get("matched")
+    if match_id:
+        log(f"  ✓ D matched immediately: intent_id={intent_id} match_id={match_id} "
+            f"(D earns {d_floor_bps - floor_bps}bp spread over SOFR floor)")
+    else:
+        log(f"  intent_id={intent_id} — posted at {d_floor_bps}bps, TTL {D_INTENT_TTL_SEC}s "
+            f"(waiting for matcher cycle or new borrower)")
+
+
 def _expiry_of(loan: dict) -> int:
     """Get expiry timestamp; fallback for legacy entries that don't store it."""
     if "expiry" in loan:
@@ -712,7 +839,7 @@ def main() -> int:
     # Balances snapshot
     for w in wallets:
         b = chain.balances(w.addr)
-        role = "data-buyer" if w.name == DATA_BUYER_NAME else ("executor" if w.name in EXECUTOR_NAMES else "?")
+        role = "data-buyer+quoter" if w.name == DATA_BUYER_NAME else ("executor" if w.name in EXECUTOR_NAMES else "?")
         log(f"  {w.name} ({role}) {w.addr[:8]}…  ETH={b['eth']:.5f}  USDC=${b['usdc']:.3f}  WETH={b['weth']:.5f}")
 
     # First: refresh Agent-SOFR cache if stale (D pays $0.001 via x402)
@@ -723,6 +850,16 @@ def main() -> int:
 
     floor, regime = sofr_floor_bps()
     log(f"  current SOFR floor: {floor} bps (regime={regime})")
+
+    # D-quoter pass: if external borrower intents are in the book and the rate
+    # is profitable (≥ floor + D_MIN_SPREAD_BPS), D undercuts and quotes as
+    # lender of last resort. Internal B/C intents are excluded so this never
+    # round-trips USDC between our own wallets. Runs BEFORE the random action
+    # so D always gets first dibs on external demand.
+    try:
+        act_quoter_d(wallets, chain)
+    except Exception as e:
+        log(f"  ✗ D-quoter errored: {e}")
 
     # Always opportunistically repay first if anything is due
     state = state_load()
