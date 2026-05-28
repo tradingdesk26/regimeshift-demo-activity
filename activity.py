@@ -68,25 +68,31 @@ P_REPAY         = 0.10
 
 # ─── D-quoter policy ──────────────────────────────────────────────────────────
 # Two-tier policy:
-#   EXTERNAL wallets — D always satisfies if external is "better than market":
-#     * Lender side: external borrower.max_rate ≥ floor → D takes (earns floor)
-#     * Borrower side: external lender.min_rate ≤ floor → D takes (pays floor)
-#   The only limits are D's actual capital — no D_MAX_LOAN cap, no min-spread.
-#   We accept the per-trade economic cost of "always satisfy" because the
-#   marketing value of clearing organic external flow exceeds the ~$0.07/loan
-#   gas + ~$0.0003/h interest cost.
+#   EXTERNAL wallets — D satisfies if external UNDERCUTS our best internal quote
+#     (i.e. better than ALL of our lender/borrower asks on the same side).
+#     * Lender side: external.min_rate < OUR_BEST_LENDER_RATE → D takes (D borrows)
+#       (external offers cheaper money than B/C — must take before B/C lose deal flow)
+#     * Borrower side: external.max_rate > OUR_BEST_BORROWER_RATE → D takes (D lends)
+#       (external offers more interest than our borrowers can — better return for D)
+#     Duration: D matches external's max_duration_sec (capped at D_MAX_DURATION_SEC
+#     for safety) so external doesn't have to wait for matching duration.
+#     If external is at-or-worse than our best → no priority. External waits in
+#     normal FIFO queue; if they want priority they can re-post at a better price.
 #
 #   INTERNAL wallets (B/C cross via act_paired) — keep the existing algorithm
-#   with spreads + randomization. That guard lives in matcher.py + act_paired.
+#   with spreads + randomization. Unchanged.
+#
+# Fallback: if no internal lenders/borrowers exist, "best" reference is the
+# SOFR floor — D takes externals at-or-below floor (lender) / at-or-above (borrower).
 #
 # Hard physical limits on D:
 D_RESERVE_USDC      = 2.0     # keep ≥$2 USDC for future SOFR refreshes
 D_BORROW_MIN_WETH   = 0.0003  # need ≥this much WETH to attempt a borrow
-D_MAX_DURATION_SEC  = 3600    # don't lock D capital >1h on a single trade
+D_MAX_DURATION_SEC  = 86400   # ≤24h on a single D trade (loosened from 1h)
 D_INTENT_TTL_SEC    = 900     # D intents expire after 15 min if unmatched
 
 # Legacy: kept for backwards-compat references in code below. Effectively zero.
-D_MIN_SPREAD_BPS    = 0       # external policy: take at floor, no spread req
+D_MIN_SPREAD_BPS    = 0       # external policy: undercut to win, no spread
 D_BORROW_INTENT_TTL_SEC = D_INTENT_TTL_SEC
 
 
@@ -725,9 +731,19 @@ def act_quoter_d(wallets: list[Wallet], chain: Chain) -> None:
 
     internal = {w.addr.lower() for w in wallets}
     floor_bps, regime = sofr_floor_bps()
-    # POLICY: D always satisfies external borrowers willing to pay AT LEAST floor.
-    # No spread req, no D_MAX_LOAN cap — bounded only by D's deployable USDC.
-    d_floor_bps = floor_bps  # D quotes at exactly floor (was floor+spread)
+
+    # POLICY: D takes only externals that BEAT our best internal borrower bid.
+    # If no internal borrowers in book, fallback threshold is the SOFR floor.
+    our_borrower_bids = [int(b.get("max_rate_bps", -1)) for b in book.get("borrowers", [])
+                          if b.get("wallet", "").lower() in internal]
+    our_best_borrower_rate = max(our_borrower_bids) if our_borrower_bids else None
+    # Threshold external must exceed to get D's priority
+    priority_threshold = (our_best_borrower_rate
+                          if our_best_borrower_rate is not None
+                          else floor_bps - 1)  # -1 so equal-to-floor still beats
+    # D quotes at floor — undercuts B/C (which are at floor+spread) while
+    # remaining at the SOFR-fair price.
+    d_floor_bps = floor_bps
 
     candidates = []
     for b in book.get("borrowers", []):
@@ -741,7 +757,11 @@ def act_quoter_d(wallets: list[Wallet], chain: Chain) -> None:
             duration = int(b.get("duration_sec", 0))
         except (TypeError, ValueError):
             continue
-        # External "better than market" = max_rate ≥ floor (will clear at floor)
+        # Priority rule: external bid must strictly exceed our best internal
+        # borrower bid (or floor-1 if none). At-or-worse → leave for normal FIFO.
+        if max_rate <= priority_threshold:
+            continue
+        # Matcher will quote at d_floor_bps; check borrower still accepts it
         if max_rate < d_floor_bps:
             continue
         # Bounded by D's actual USDC capital, not by an arbitrary cap
@@ -752,7 +772,9 @@ def act_quoter_d(wallets: list[Wallet], chain: Chain) -> None:
         candidates.append((max_rate, principal, duration, b))
 
     if not candidates:
-        log(f"  D-quoter: no external borrower intents ≥ floor ({d_floor_bps}bps)")
+        log(f"  D-quoter: no external borrowers beating our best bid "
+            f"(threshold={priority_threshold}bps, "
+            f"our_best_borrower={our_best_borrower_rate or 'none — using floor'})")
         return
 
     # Best candidate = highest max_rate (most cushion for D's quote to win)
@@ -846,6 +868,16 @@ def act_borrower_quoter_d(wallets: list[Wallet], chain: Chain) -> None:
     floor_bps, regime = sofr_floor_bps()
     eth_price = fetch_live_eth_usd_for_collat()
 
+    # POLICY: D takes only externals that BEAT (undercut) our best internal
+    # lender ask. If no internal lenders, fallback threshold is the SOFR floor.
+    our_lender_asks = [int(l.get("min_rate_bps", 10**9)) for l in book.get("lenders", [])
+                        if l.get("wallet", "").lower() in internal]
+    our_best_lender_rate = min(our_lender_asks) if our_lender_asks else None
+    # Threshold external must beat (be strictly lower) to get D's priority
+    priority_threshold = (our_best_lender_rate
+                          if our_best_lender_rate is not None
+                          else floor_bps + 1)  # +1 so equal-to-floor still beats
+
     candidates = []
     for l in book.get("lenders", []):
         if l.get("wallet", "").lower() in internal:
@@ -862,10 +894,9 @@ def act_borrower_quoter_d(wallets: list[Wallet], chain: Chain) -> None:
             continue
         if max_dur < 300:
             continue
-        # POLICY: external "better than market" = min_rate ≤ floor (matcher
-        # will floor-clamp up to floor max, so D pays at most floor).
-        # Above-floor offers mean external asks for premium → D doesn't subsidize.
-        if min_rate > floor_bps:
+        # Priority rule: external ask must strictly undercut our best internal
+        # lender ask. At-or-worse → leave for FIFO (B/C cheaper, match them first).
+        if min_rate >= priority_threshold:
             continue
         # Bounded by D's actual WETH (worst-case 0.55 LTV + 10% safety buffer)
         collat_needed = amount / 0.55 / eth_price * 1.10
@@ -874,24 +905,28 @@ def act_borrower_quoter_d(wallets: list[Wallet], chain: Chain) -> None:
         candidates.append((min_rate, amount, max_dur, collat_needed, l))
 
     if not candidates:
-        log(f"  D-borrower: no external lender intents to take "
-            f"(need min_rate ≤ floor={floor_bps}bps, collat-fittable in {bal['weth']:.5f} WETH)")
+        log(f"  D-borrower: no external lender intents undercutting our best "
+            f"(threshold={priority_threshold}bps, "
+            f"our_best_lender={our_best_lender_rate or 'none — using floor'}, "
+            f"collat-fittable in {bal['weth']:.5f} WETH)")
         return
 
-    # Best candidate = lowest min_rate (cheapest for D to take)
+    # Best candidate = lowest min_rate (the most aggressive undercut)
     candidates.sort(key=lambda x: x[0])
     min_rate, amount, max_dur, collat_needed, target = candidates[0]
     target_wallet = target.get("wallet", "")[:10]
+    # Per policy: adjust D's duration to external's max_duration (capped by D's
+    # safety limit). External shouldn't have to wait for matching duration.
     duration = min(max_dur, D_MAX_DURATION_SEC)
 
-    # D's max_rate must accommodate the matcher's floor-clamp. Give floor+50bp
-    # ceiling so a rate bump from below-floor lender still clears.
-    d_max_rate = floor_bps + 50
+    # D's max_rate ceiling: be generous so matcher's floor-clamp + any drift
+    # between intent post and match can't reject. Hard cap at 50% APR sanity.
+    d_max_rate = max(min_rate, floor_bps) + 50
 
     log(f"→ D-BORROW: external lender {target_wallet}… offers ${amount:.2f} USDC "
-        f"@ ≥{min_rate}bps for ≤{max_dur}s. D borrows ${amount:.2f} @ ≤{d_max_rate}bps "
-        f"for {duration}s, collat ≤ {collat_needed:.5f} WETH (have {bal['weth']:.5f}, "
-        f"floor={floor_bps}, eff_rate=max({min_rate},{floor_bps})={max(min_rate, floor_bps)}bps)")
+        f"@ ≥{min_rate}bps for ≤{max_dur}s (undercuts our best={our_best_lender_rate or 'floor'}). "
+        f"D borrows ${amount:.2f} @ ≤{d_max_rate}bps for {duration}s, "
+        f"collat ≤ {collat_needed:.5f} WETH (have {bal['weth']:.5f})")
 
     # Pre-approve: WETH for V4 collateral, USDC for repay
     try:
