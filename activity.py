@@ -95,6 +95,22 @@ D_INTENT_TTL_SEC    = 900     # D intents expire after 15 min if unmatched
 D_MIN_SPREAD_BPS    = 0       # external policy: undercut to win, no spread
 D_BORROW_INTENT_TTL_SEC = D_INTENT_TTL_SEC
 
+# ─── D market-maker — standing depth at fixed size tiers ─────────────────────
+# Beyond the reactive quoter functions above, D maintains standing offers at
+# fixed dollar size tiers on BOTH sides of the book. This shows visible depth
+# to external agents: "D will lend you $1, $3, or $5 at floor; D will borrow
+# $1, $3, or $5 from you at up to floor+50bp". External takers match D's
+# tier closest to their size.
+#
+# Skipped tiers (capacity-bound):
+#   - Lender side skipped if deployable USDC < tier size
+#   - Borrower side skipped if WETH-collateral < required at 0.55 LTV
+# Each tier intent has the standard TTL — automatically refreshed each fire
+# if matched or expired.
+D_MAKER_SIZES_USDC  = [1.0, 3.0, 5.0]
+D_MAKER_DURATION_SEC = 3600   # standing offer's max duration (lenders) /
+                              # exact duration (borrowers). 1h is liquid.
+
 
 # ─── ABIs ────────────────────────────────────────────────────────────────────
 
@@ -960,6 +976,130 @@ def act_borrower_quoter_d(wallets: list[Wallet], chain: Chain) -> None:
             f"(waiting for matcher or external borrower to step in)")
 
 
+def act_market_make_d(wallets: list[Wallet], chain: Chain) -> None:
+    """Standing market depth at D_MAKER_SIZES_USDC tiers, both sides.
+
+    Each fire: check which of $1 / $3 / $5 tiers D doesn't have open intents
+    for, and post fresh ones at SOFR floor (lender side) / floor+50bp ceiling
+    (borrower side). Capacity-bound — skip tiers that don't fit D's remaining
+    deployable USDC (lender) or WETH (borrower).
+
+    Standing depth means external takers always see liquidity at multiple
+    size points. Matcher's internal-wallet guard ensures these only match
+    against EXTERNAL counter-parties — B/C internal flow is untouched.
+    """
+    d = next((w for w in wallets if w.name == DATA_BUYER_NAME), None)
+    if not d:
+        return
+
+    bal = chain.balances(d.addr)
+    if bal["eth"] < MIN_ETH_GAS:
+        log(f"  D-maker: gas too low ({bal['eth']:.5f}) — skip refresh")
+        return
+
+    try:
+        book = api_open_book()
+    except Exception as e:
+        log(f"  D-maker: book fetch failed: {e}")
+        return
+
+    floor_bps, regime = sofr_floor_bps()
+    eth_price = fetch_live_eth_usd_for_collat()
+
+    # ─── Lender side: post tiers D doesn't have, capped by USDC ─────────────
+    d_lender_sizes = sorted(
+        round(float(l.get("amount", 0)), 6)
+        for l in book.get("lenders", [])
+        if l.get("wallet", "").lower() == d.addr.lower()
+    )
+    usdc_used     = sum(d_lender_sizes)
+    usdc_avail    = max(0.0, bal["usdc"] - D_RESERVE_USDC - usdc_used)
+    posted_lender = []
+    for sz in D_MAKER_SIZES_USDC:
+        # Skip if D already has an offer at exactly this size
+        if any(abs(s - sz) < 0.001 for s in d_lender_sizes):
+            continue
+        if usdc_avail < sz:
+            log(f"  D-maker: lender ${sz} skipped — only ${usdc_avail:.2f} deployable USDC left")
+            continue
+        try:
+            chain.ensure_allowance(d, chain.usdc, int(sz * 1e6))
+        except Exception as e:
+            log(f"  D-maker: lender ${sz} approve failed: {e}")
+            continue
+        try:
+            resp = api_post_lender(
+                d, amount_usdc=sz,
+                min_rate_bps=floor_bps,
+                max_duration_sec=D_MAKER_DURATION_SEC,
+                expires_at=int(time.time()) + D_INTENT_TTL_SEC,
+            )
+        except Exception as e:
+            log(f"  D-maker: lender ${sz} post failed: {e}")
+            continue
+        usdc_avail -= sz
+        match_id = resp.get("matched")
+        posted_lender.append((sz, resp.get("intent_id"), match_id))
+        if match_id:
+            _try_originate_d_match(d, match_id, wallets, chain)
+
+    # ─── Borrower side: post tiers D doesn't have, capped by WETH ───────────
+    d_borrower_sizes = sorted(
+        round(float(b.get("principal_amount", 0)), 6)
+        for b in book.get("borrowers", [])
+        if b.get("wallet", "").lower() == d.addr.lower()
+    )
+    weth_used = sum(s / 0.55 / eth_price * 1.10 for s in d_borrower_sizes)
+    weth_avail = max(0.0, bal["weth"] * 0.9 - weth_used)
+    d_max_rate = floor_bps + 50
+    posted_borrower = []
+    for sz in D_MAKER_SIZES_USDC:
+        if any(abs(s - sz) < 0.001 for s in d_borrower_sizes):
+            continue
+        collat = sz / 0.55 / eth_price * 1.10
+        if weth_avail < collat:
+            log(f"  D-maker: borrow ${sz} skipped — need {collat:.5f} WETH, only {weth_avail:.5f} deployable")
+            continue
+        try:
+            chain.ensure_allowance(d, chain.weth, int(collat * 1e18))
+            chain.ensure_allowance(d, chain.usdc, int(sz * 1.02 * 1e6))
+        except Exception as e:
+            log(f"  D-maker: borrow ${sz} approve failed: {e}")
+            continue
+        try:
+            resp = api_post_borrower(
+                d, principal=sz, collat_max=collat,
+                duration_sec=D_MAKER_DURATION_SEC,
+                max_rate_bps=d_max_rate,
+                expires_at=int(time.time()) + D_BORROW_INTENT_TTL_SEC,
+            )
+        except Exception as e:
+            log(f"  D-maker: borrow ${sz} post failed: {e}")
+            continue
+        weth_avail -= collat
+        match_id = resp.get("matched")
+        posted_borrower.append((sz, resp.get("intent_id"), match_id))
+        if match_id:
+            _try_originate_d_match(d, match_id, wallets, chain)
+
+    # Summary log
+    if posted_lender or posted_borrower:
+        l_summary = ", ".join(
+            f"${sz}{'⚡'+m[:8] if m else ''}"
+            for sz, _, m in posted_lender
+        ) or "—"
+        b_summary = ", ".join(
+            f"${sz}{'⚡'+m[:8] if m else ''}"
+            for sz, _, m in posted_borrower
+        ) or "—"
+        log(f"  D-maker: lender posts [{l_summary}], borrow posts [{b_summary}] "
+            f"(floor={floor_bps}bps, regime={regime})")
+    else:
+        existing_l = ",".join(f"${s}" for s in d_lender_sizes) or "none"
+        existing_b = ",".join(f"${s}" for s in d_borrower_sizes) or "none"
+        log(f"  D-maker: book already has D depth — lenders [{existing_l}] borrowers [{existing_b}]")
+
+
 def _try_originate_d_match(d: Wallet, match_id: str, wallets: list[Wallet], chain: Chain) -> None:
     """When D is matched against an external counter-party, D calls originate()
     on-chain. The signed quote is fetched from the API, allowances are confirmed
@@ -1151,11 +1291,14 @@ def main() -> int:
     log(f"  current SOFR floor: {floor} bps (regime={regime})")
 
     # D-quoter passes: D acts as market maker on BOTH sides of organic flow.
-    # Lender-side: if external borrower intents are above SOFR floor + spread,
-    #   D undercuts and quotes lender (earns spread).
-    # Borrower-side: if external lender intents are below SOFR floor + ceiling,
-    #   D takes the offer as borrower (absorbs supply, demo-only economics).
-    # Both pass internal-wallet filters so neither matches B/C round-trips.
+    # Three layers, run in priority order:
+    #   1. Reactive lender (act_quoter_d): catch externals undercutting our best
+    #      borrower bid — D mirrors their size and matches.
+    #   2. Reactive borrower (act_borrower_quoter_d): catch externals undercutting
+    #      our best lender ask — D mirrors their size and matches.
+    #   3. Standing market (act_market_make_d): maintain $1/$3/$5 depth tiers
+    #      on both sides at floor (lender) and floor+50bp ceiling (borrower).
+    #      Refreshed each fire as tiers get matched or expire.
     try:
         act_quoter_d(wallets, chain)
     except Exception as e:
@@ -1164,6 +1307,10 @@ def main() -> int:
         act_borrower_quoter_d(wallets, chain)
     except Exception as e:
         log(f"  ✗ D-borrower-quoter errored: {e}")
+    try:
+        act_market_make_d(wallets, chain)
+    except Exception as e:
+        log(f"  ✗ D-market-maker errored: {e}")
 
     # Always opportunistically repay first if anything is due
     state = state_load()
