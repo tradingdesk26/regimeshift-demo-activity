@@ -473,11 +473,48 @@ def rand_duration_sec() -> int:
     return random.choice([900, 1200, 1800])
 
 
-def collat_for_principal(principal_usdc: float, eth_price_usd: float = 2080.0) -> float:
+_eth_price_cache: dict = {"price": 0.0, "fetched_at": 0.0}
+
+def fetch_live_eth_usd_for_collat() -> float:
+    """Read Chainlink ETH/USD on Base — same feed V4 contract uses for LTV check.
+    Cached 25s. Falls back to $2000 if RPC fails. Used to size borrower's
+    collat_max so it doesn't get under-provisioned when ETH price moves between
+    intent post and matcher tick."""
+    now = time.time()
+    if now - _eth_price_cache["fetched_at"] < 25 and _eth_price_cache["price"] > 0:
+        return _eth_price_cache["price"]
+    try:
+        import json as _j, urllib.request as _u
+        req = _u.Request(
+            RPC_URL,
+            data=_j.dumps({
+                "jsonrpc": "2.0", "id": 1,
+                "method": "eth_call",
+                "params": [{"to": "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70",
+                            "data": "0xfeaf968c"}, "latest"],
+            }).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        body = _j.loads(_u.urlopen(req, timeout=5).read())
+        answer = int(body["result"][2:][64:128], 16)
+        price = answer / 1e8
+        if 500 < price < 100000:
+            _eth_price_cache.update(price=price, fetched_at=now)
+            return price
+    except Exception:
+        pass
+    _eth_price_cache.update(price=2000.0, fetched_at=now)
+    return 2000.0
+
+
+def collat_for_principal(principal_usdc: float, eth_price_usd: float | None = None) -> float:
     """Post collat_max high enough to fit WORST-CASE regime (EXTREME → LTV cap 55%).
     The matcher will actually pull less based on the live regime, so generosity here
     just means "don't get rejected because of regime drift between book scan and match".
+    Uses live Chainlink ETH price (cached 25s) — falls back to $2000 if RPC fails.
     1.10× buffer for ETH price moves between intent post and match."""
+    if eth_price_usd is None:
+        eth_price_usd = fetch_live_eth_usd_for_collat()
     worst_case_ltv = 0.55     # EXTREME regime cap
     return round(principal_usdc / (worst_case_ltv * eth_price_usd) * 1.10, 6)
 
