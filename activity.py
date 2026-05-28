@@ -78,6 +78,17 @@ D_RESERVE_USDC      = 2.0     # keep ≥$2 in D for future SOFR refreshes
 D_MAX_DURATION_SEC  = 3600    # don't lock D capital >1h on a single quote
 D_INTENT_TTL_SEC    = 900     # D's lender intent expires after 15 min if unmatched
 
+# ─── D-borrower-quoter (taker for external lender intents) ───────────────────
+# Symmetric to D-lender-quoter: when external LENDER intents appear in the book
+# at a rate D can stomach (≤ floor + small ceiling buffer), D posts a BORROW
+# intent for the same amount, posting WETH as collateral. Matcher will clear
+# at lender's rate (or floor if below). D pays the interest, but absorbs the
+# external lender's offer so the demo serves both sides of organic traffic.
+D_BORROW_MAX_USDC          = 3.0       # D won't borrow more than $3 per loan
+D_BORROW_RATE_CEILING_BPS  = 30        # D won't borrow at rates > floor+30bp
+D_BORROW_MIN_WETH          = 0.0003    # need at least this much WETH to attempt
+D_BORROW_INTENT_TTL_SEC    = 900       # D's borrow intent expires after 15 min
+
 
 # ─── ABIs ────────────────────────────────────────────────────────────────────
 
@@ -406,8 +417,9 @@ def api_post_lender(wallet: Wallet, amount_usdc: float, min_rate_bps: int, max_d
     return r.json()
 
 
-def api_post_borrower(wallet: Wallet, principal: float, collat_max: float, duration_sec: int, max_rate_bps: int) -> dict:
-    r = requests.post(f"{API_BASE}/v1/intent/borrow", timeout=15, json={
+def api_post_borrower(wallet: Wallet, principal: float, collat_max: float, duration_sec: int,
+                      max_rate_bps: int, expires_at: int | None = None) -> dict:
+    body = {
         "wallet": wallet.addr,
         "principal_asset": "USDC",
         "principal_amount": principal,
@@ -415,7 +427,10 @@ def api_post_borrower(wallet: Wallet, principal: float, collat_max: float, durat
         "collateral_amount_max": collat_max,
         "duration_sec": duration_sec,
         "max_rate_bps": max_rate_bps,
-    })
+    }
+    if expires_at is not None:
+        body["expires_at"] = int(expires_at)
+    r = requests.post(f"{API_BASE}/v1/intent/borrow", timeout=15, json=body)
     r.raise_for_status()
     return r.json()
 
@@ -769,11 +784,219 @@ def act_quoter_d(wallets: list[Wallet], chain: Chain) -> None:
     intent_id = resp.get("intent_id", "?")
     match_id  = resp.get("matched")
     if match_id:
-        log(f"  ✓ D matched immediately: intent_id={intent_id} match_id={match_id} "
+        log(f"  ✓ D matched as lender: intent_id={intent_id} match_id={match_id} "
             f"(D earns {d_floor_bps - floor_bps}bp spread over SOFR floor)")
+        # If matched against external borrower, D originates the loan on-chain
+        _try_originate_d_match(d, match_id, wallets, chain)
     else:
         log(f"  intent_id={intent_id} — posted at {d_floor_bps}bps, TTL {D_INTENT_TTL_SEC}s "
             f"(waiting for matcher cycle or new borrower)")
+
+
+def act_borrower_quoter_d(wallets: list[Wallet], chain: Chain) -> None:
+    """D as borrower-of-last-resort against EXTERNAL lenders.
+
+    Symmetric to act_quoter_d (lender side). Scans open lender intents,
+    filters out internal wallets, and if an external lender is offering USDC
+    at a rate D can absorb (≤ floor + D_BORROW_RATE_CEILING_BPS), D posts a
+    borrow intent for the same amount using its WETH as collateral.
+
+    D's economics here are intentionally take-the-trade: D pays interest to
+    the external lender, with no immediate productive use of the borrowed
+    USDC. The protocol-level benefit is that organic external lender intents
+    actually clear (vs. expiring unmatched), demonstrating the platform
+    serves both sides of agent-to-agent traffic.
+
+    Capital limits:
+      - max $3 / loan (D_BORROW_MAX_USDC)
+      - skip rates > floor + 30bp
+      - skip if D's WETH < 0.0003 (under-collateralized)
+      - 15-min TTL on D's borrow intent
+    """
+    d = next((w for w in wallets if w.name == DATA_BUYER_NAME), None)
+    if not d:
+        return
+
+    bal = chain.balances(d.addr)
+    if bal["weth"] < D_BORROW_MIN_WETH:
+        log(f"  D-borrower: WETH too low ({bal['weth']:.5f} < {D_BORROW_MIN_WETH}) — skip")
+        return
+    if bal["eth"] < MIN_ETH_GAS:
+        log(f"  D-borrower: gas too low ({bal['eth']:.5f}) — skip")
+        return
+
+    try:
+        book = api_open_book()
+    except Exception as e:
+        log(f"  D-borrower: book fetch failed: {e}")
+        return
+
+    # Don't compete with self
+    d_open_borrows = [b for b in book.get("borrowers", [])
+                      if b.get("wallet", "").lower() == d.addr.lower()]
+    if d_open_borrows:
+        log(f"  D-borrower: already have {len(d_open_borrows)} open borrow intent(s) — skip")
+        return
+
+    internal = {w.addr.lower() for w in wallets}
+    floor_bps, regime = sofr_floor_bps()
+    eth_price = fetch_live_eth_usd_for_collat()
+
+    candidates = []
+    for l in book.get("lenders", []):
+        if l.get("wallet", "").lower() in internal:
+            continue
+        if l.get("asset") != "USDC":
+            continue
+        try:
+            min_rate = int(l.get("min_rate_bps", 0))
+            amount = float(l.get("amount", 0))
+            max_dur = int(l.get("max_duration_sec", 0))
+        except (TypeError, ValueError):
+            continue
+        if amount <= 0 or amount > D_BORROW_MAX_USDC:
+            continue
+        if max_dur < 300:
+            continue
+        # Matcher will clear at max(min_rate, floor). D refuses if effective
+        # rate > floor + ceiling — too expensive to take just for the demo.
+        effective_rate = max(min_rate, floor_bps)
+        if effective_rate > floor_bps + D_BORROW_RATE_CEILING_BPS:
+            continue
+        # Check that collateral fits in D's WETH (worst-case 0.55 LTV + 10% buffer)
+        collat_needed = amount / 0.55 / eth_price * 1.10
+        if collat_needed > bal["weth"] * 0.9:
+            continue
+        candidates.append((min_rate, amount, max_dur, collat_needed, l))
+
+    if not candidates:
+        log(f"  D-borrower: no external lender intents to take "
+            f"(need ≤floor+{D_BORROW_RATE_CEILING_BPS}bp, ≤${D_BORROW_MAX_USDC}, collat-fittable)")
+        return
+
+    # Best candidate = lowest min_rate (cheapest for D to take)
+    candidates.sort(key=lambda x: x[0])
+    min_rate, amount, max_dur, collat_needed, target = candidates[0]
+    target_wallet = target.get("wallet", "")[:10]
+    duration = min(max_dur, D_MAX_DURATION_SEC)
+
+    # D's max_rate must accommodate the matcher's floor-clamp. Give floor+50bp
+    # ceiling so a rate bump from below-floor lender still clears.
+    d_max_rate = floor_bps + 50
+
+    log(f"→ D-BORROW: external lender {target_wallet}… offers ${amount:.2f} USDC "
+        f"@ ≥{min_rate}bps for ≤{max_dur}s. D borrows ${amount:.2f} @ ≤{d_max_rate}bps "
+        f"for {duration}s, collat ≤ {collat_needed:.5f} WETH (have {bal['weth']:.5f}, "
+        f"floor={floor_bps}, eff_rate=max({min_rate},{floor_bps})={max(min_rate, floor_bps)}bps)")
+
+    # Pre-approve: WETH for V4 collateral, USDC for repay
+    try:
+        chain.ensure_allowance(d, chain.weth, int(collat_needed * 1e18))
+        chain.ensure_allowance(d, chain.usdc, int(amount * 1.02 * 1e6))
+    except Exception as e:
+        log(f"  D-borrower: approve failed: {e}")
+        return
+
+    try:
+        resp = api_post_borrower(
+            d,
+            principal=amount,
+            collat_max=collat_needed,
+            duration_sec=duration,
+            max_rate_bps=d_max_rate,
+            expires_at=int(time.time()) + D_BORROW_INTENT_TTL_SEC,
+        )
+    except Exception as e:
+        log(f"  D-borrower: post failed: {e}")
+        return
+
+    intent_id = resp.get("intent_id", "?")
+    match_id  = resp.get("matched")
+    if match_id:
+        log(f"  ✓ D matched as borrower: intent_id={intent_id} match_id={match_id}")
+        # Step 3: D needs to originate the loan on-chain
+        _try_originate_d_match(d, match_id, wallets, chain)
+    else:
+        log(f"  intent_id={intent_id} — posted, TTL {D_BORROW_INTENT_TTL_SEC}s "
+            f"(waiting for matcher or external borrower to step in)")
+
+
+def _try_originate_d_match(d: Wallet, match_id: str, wallets: list[Wallet], chain: Chain) -> None:
+    """When D is matched against an external counter-party, D calls originate()
+    on-chain. The signed quote is fetched from the API, allowances are confirmed
+    on D's side, then D submits originate(). The external counter-party already
+    approved their side (e.g. external lender approved USDC for V4 yesterday)."""
+    time.sleep(2)  # let DB write settle
+    try:
+        m = api_fetch_match(match_id)
+    except Exception as e:
+        log(f"  ⚠ D-originate: fetch match {match_id} failed: {e}")
+        return
+    if not m:
+        log(f"  ⚠ D-originate: match {match_id} not in /v1/matches/recent")
+        return
+
+    q = m["quote"]["quote"]
+    sig = m["quote"]["signature"]
+    d_addr_lo = d.addr.lower()
+    d_is_borrower = q["borrower"].lower() == d_addr_lo
+    d_is_lender   = q["lender"].lower()   == d_addr_lo
+    if not (d_is_borrower or d_is_lender):
+        log(f"  ⚠ D-originate: match doesn't involve D, skip")
+        return
+
+    # Ensure allowances on D's side
+    try:
+        if d_is_borrower:
+            chain.ensure_allowance(d, chain.weth, int(q["collateralAmount"]))
+            chain.ensure_allowance(d, chain.usdc, int(int(q["principalAmount"]) * 1.02))
+        else:  # d_is_lender
+            chain.ensure_allowance(d, chain.usdc, int(q["principalAmount"]))
+    except Exception as e:
+        log(f"  ⚠ D-originate: approve failed: {e}")
+        return
+
+    quote_tuple = (
+        Web3.to_checksum_address(q["borrower"]),
+        Web3.to_checksum_address(q["lender"]),
+        Web3.to_checksum_address(q["principalToken"]),
+        int(q["principalAmount"]),
+        Web3.to_checksum_address(q["collateralToken"]),
+        int(q["collateralAmount"]),
+        int(q["expiryTimestamp"]),
+        int(q["rateBps"]),
+        bytes.fromhex(q["nonce"][2:]),
+    )
+    sig_bytes = bytes.fromhex(sig[2:])
+
+    log(f"  D originating loan with external {'lender' if d_is_borrower else 'borrower'} "
+        f"({q['lender' if d_is_borrower else 'borrower'][:14]}…), "
+        f"principal=${int(q['principalAmount'])/1e6:.4f} rate={q['rateBps']}bps")
+    try:
+        tx = chain.send(d.account, chain.repo.functions.originate(quote_tuple, sig_bytes), gas=600_000)
+    except Exception as e:
+        log(f"  ✗ D-originate: send failed: {e}")
+        return
+    log(f"  originate tx: https://basescan.org/tx/{tx}")
+    if not chain.wait(tx):
+        log(f"  ✗ D-originate: reverted on-chain")
+        return
+    log(f"  ✓ loan opened: loanId={q['nonce']}")
+
+    # Track in state.json so the repay cycle handles it
+    state = state_load()
+    now_ts = int(time.time())
+    state["our_loans"].append({
+        "loan_id":     q["nonce"],
+        "lender":      d.name if d_is_lender else "EXTERNAL",
+        "borrower":    d.name if d_is_borrower else "EXTERNAL",
+        "principal":   int(q["principalAmount"]) / 1e6,
+        "rate_bps":    int(q["rateBps"]),
+        "originated":  now_ts,
+        "repay_after": now_ts + int(q["expiryTimestamp"] - now_ts) // 2,
+        "expiry":      int(q["expiryTimestamp"]),
+    })
+    state_save(state)
 
 
 def _expiry_of(loan: dict) -> int:
@@ -888,15 +1111,20 @@ def main() -> int:
     floor, regime = sofr_floor_bps()
     log(f"  current SOFR floor: {floor} bps (regime={regime})")
 
-    # D-quoter pass: if external borrower intents are in the book and the rate
-    # is profitable (≥ floor + D_MIN_SPREAD_BPS), D undercuts and quotes as
-    # lender of last resort. Internal B/C intents are excluded so this never
-    # round-trips USDC between our own wallets. Runs BEFORE the random action
-    # so D always gets first dibs on external demand.
+    # D-quoter passes: D acts as market maker on BOTH sides of organic flow.
+    # Lender-side: if external borrower intents are above SOFR floor + spread,
+    #   D undercuts and quotes lender (earns spread).
+    # Borrower-side: if external lender intents are below SOFR floor + ceiling,
+    #   D takes the offer as borrower (absorbs supply, demo-only economics).
+    # Both pass internal-wallet filters so neither matches B/C round-trips.
     try:
         act_quoter_d(wallets, chain)
     except Exception as e:
-        log(f"  ✗ D-quoter errored: {e}")
+        log(f"  ✗ D-lender-quoter errored: {e}")
+    try:
+        act_borrower_quoter_d(wallets, chain)
+    except Exception as e:
+        log(f"  ✗ D-borrower-quoter errored: {e}")
 
     # Always opportunistically repay first if anything is due
     state = state_load()
