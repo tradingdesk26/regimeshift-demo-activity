@@ -114,4 +114,4 @@ Both are one-shots, idempotent enough to re-run if needed.
 
 ## License
 
-TBD post-hackathon.
+TBD — source-code license under review.
