@@ -60,11 +60,17 @@ CHAIN_ID        = 8453
 MAX_ACTIVE_LOANS = 5
 MIN_ETH_GAS      = 0.00005     # below this, wallet skipped (out of gas)
 
-# Action probabilities — must sum to 1.0
-P_LENDER_ONLY   = 0.35
-P_BORROWER_ONLY = 0.35
-P_PAIRED        = 0.20
-P_REPAY         = 0.10
+# Action probabilities — must sum to 1.0.
+# NOTE: repay runs UNCONDITIONALLY before this roll (see main()), so P_REPAY is
+# only the implicit NO-OP remainder, not a repay trigger. With no organic external
+# counterparties, single-side lender/borrower posts just rest unmatched — only
+# act_paired (B↔C self-cross) produces settled on-chain loans. Bumped P_PAIRED
+# 0.20→0.50 for visible demo activity (2026-06-01); trimmed the single-side and
+# NO-OP bands accordingly.
+P_LENDER_ONLY   = 0.22
+P_BORROWER_ONLY = 0.22
+P_PAIRED        = 0.50
+P_REPAY         = 0.06
 
 # ─── D-quoter policy ──────────────────────────────────────────────────────────
 # Two-tier policy:
@@ -153,6 +159,14 @@ REPO_ABI = [
     {"name": "currentOwed", "type": "function", "stateMutability": "view",
      "inputs":  [{"name": "loanId", "type": "bytes32"}],
      "outputs": [{"type": "uint256"}]},
+    # Full loan struct getter — used by reconcile_external_loans() to read
+    # borrower/lender/expiry/flags on-chain as the source of truth.
+    {"name": "loans", "type": "function", "stateMutability": "view",
+     "inputs":  [{"type": "bytes32"}],
+     "outputs": [{"type": "address"}, {"type": "address"}, {"type": "address"},
+                 {"type": "uint256"}, {"type": "address"}, {"type": "uint256"},
+                 {"type": "uint256"}, {"type": "uint256"}, {"type": "uint256"},
+                 {"type": "bool"}, {"type": "bool"}, {"type": "bool"}]},
 ]
 
 
@@ -1186,6 +1200,71 @@ def _expiry_of(loan: dict) -> int:
     return int(loan["originated"]) + 1800
 
 
+def reconcile_external_loans(wallets: list[Wallet], chain: Chain) -> None:
+    """Adopt loans where WE are the borrower but an EXTERNAL counterparty called
+    originate(), so our normal post-originate tracking never recorded them.
+
+    act_paired (and the D-quoters) `return` early when a match involves an
+    external wallet — "let the other party originate" — and therefore never
+    append the loan to state["our_loans"]. Such loans are then invisible to
+    act_repay, and we silently drift past expiry into default.
+    (Incident 2026-05-31: loan 0xdc5af02b… expired untracked, borrower=WALLET_B.)
+
+    The API loan-registry is used only to ENUMERATE candidate loanIds; the CHAIN
+    (loans() getter) is the source of truth for borrower/expiry/flags — we never
+    trust the API for a repay decision. Only borrower-side loans are adopted:
+    those are the ones WE must repay. Lender-side external loans need no action
+    from us here (the borrower repays us; on their default anyone may settle)."""
+    our = {w.addr.lower(): w for w in wallets}
+    state = state_load()
+    known = {l["loan_id"].lower() for l in state["our_loans"]}
+    try:
+        registry = api_active_loans()
+    except Exception as e:
+        log(f"  reconcile: registry fetch failed ({type(e).__name__}) — skip this fire")
+        return
+
+    adopted = 0
+    now_ts = int(time.time())
+    for rec in registry:
+        lid = rec.get("loan_id")
+        if not lid or lid.lower() in known:
+            continue
+        if (rec.get("borrower") or "").lower() not in our:
+            continue  # only adopt loans WE must repay (we are the borrower)
+        # Chain is source of truth — never trust the API registry for repay.
+        try:
+            ln = chain.repo.functions.loans(bytes.fromhex(lid[2:])).call()
+        except Exception:
+            continue
+        borrower, lender = ln[0].lower(), ln[1].lower()
+        expiry = int(ln[7])
+        repaid, defaulted, liquidated = ln[9], ln[10], ln[11]
+        if borrower not in our or repaid or defaulted or liquidated:
+            continue  # not ours on-chain, or already closed
+        state["our_loans"].append({
+            "loan_id":     lid,
+            "lender":      our[lender].name if lender in our else "EXTERNAL",
+            "borrower":    our[borrower].name,
+            "principal":   int(ln[3]) / 1e6,
+            "rate_bps":    int(ln[8]),
+            "originated":  now_ts,
+            "repay_after": now_ts,    # discovered late → repay as soon as possible
+            "expiry":      expiry,
+            "adopted":     True,      # reconciled post-hoc, not bot-originated
+        })
+        known.add(lid.lower())
+        adopted += 1
+        ttl = expiry - now_ts
+        log(f"  ⚠ ADOPTED untracked loan {lid[:14]}… borrower={our[borrower].name} "
+            f"lender={our[lender].name if lender in our else 'EXTERNAL'} "
+            f"owed≈${int(ln[3])/1e6:.4f} ttl={ttl}s — "
+            f"{'PAST EXPIRY → act_repay will defaultLoan' if ttl <= 0 else 'now tracked for repay'}")
+    if adopted:
+        state_save(state)
+        log(f"  reconcile: adopted {adopted} untracked borrower-side loan(s) into state")
+
+
 def act_repay(wallets: list[Wallet], chain: Chain) -> None:
     """Repay any of OUR loans that are past repay-after.
 
@@ -1311,6 +1390,15 @@ def main() -> int:
         act_market_make_d(wallets, chain)
     except Exception as e:
         log(f"  ✗ D-market-maker errored: {e}")
+
+    # Adopt any externally-originated loans where WE are the borrower. Our
+    # post-originate tracking misses those (act_paired/D-quoters return early on
+    # an external match), so reconcile them into state BEFORE the repay sweep —
+    # otherwise they stay invisible and we drift to default. (Incident 2026-05-31.)
+    try:
+        reconcile_external_loans(wallets, chain)
+    except Exception as e:
+        log(f"  ✗ reconcile errored: {e}")
 
     # Always opportunistically repay first if anything is due
     state = state_load()
