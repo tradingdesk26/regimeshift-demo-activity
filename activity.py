@@ -114,6 +114,7 @@ D_BORROW_INTENT_TTL_SEC = D_INTENT_TTL_SEC
 # Each tier intent has the standard TTL — automatically refreshed each fire
 # if matched or expired.
 D_MAKER_SIZES_USDC  = [1.0, 3.0, 5.0]
+D_MAKER_DURATIONS   = [900, 1200, 1800, 3600]  # 15/20/30/60 min — D keeps standing depth across ALL
 D_MAKER_DURATION_SEC = 3600   # standing offer's max duration (lenders) /
                               # exact duration (borrowers). 1h is liquid.
 
@@ -1021,80 +1022,83 @@ def act_market_make_d(wallets: list[Wallet], chain: Chain) -> None:
     eth_price = fetch_live_eth_usd_for_collat()
 
     # ─── Lender side: post tiers D doesn't have, capped by USDC ─────────────
-    d_lender_sizes = sorted(
-        round(float(l.get("amount", 0)), 6)
+    d_lender_pairs = {
+        (round(float(l.get("amount", 0)), 6), int(l.get("max_duration_sec", 0)))
         for l in book.get("lenders", [])
         if l.get("wallet", "").lower() == d.addr.lower()
-    )
-    usdc_used     = sum(d_lender_sizes)
+    }
+    d_lender_sizes = sorted({a for a, _ in d_lender_pairs})  # for the summary log below
+    usdc_used     = sum(a for a, _ in d_lender_pairs)
     usdc_avail    = max(0.0, bal["usdc"] - D_RESERVE_USDC - usdc_used)
     posted_lender = []
     for sz in D_MAKER_SIZES_USDC:
-        # Skip if D already has an offer at exactly this size
-        if any(abs(s - sz) < 0.001 for s in d_lender_sizes):
-            continue
-        if usdc_avail < sz:
-            log(f"  D-maker: lender ${sz} skipped — only ${usdc_avail:.2f} deployable USDC left")
-            continue
-        try:
-            chain.ensure_allowance(d, chain.usdc, int(sz * 1e6))
-        except Exception as e:
-            log(f"  D-maker: lender ${sz} approve failed: {e}")
-            continue
-        try:
-            resp = api_post_lender(
-                d, amount_usdc=sz,
-                min_rate_bps=floor_bps,
-                max_duration_sec=D_MAKER_DURATION_SEC,
-                expires_at=int(time.time()) + D_INTENT_TTL_SEC,
-            )
-        except Exception as e:
-            log(f"  D-maker: lender ${sz} post failed: {e}")
-            continue
-        usdc_avail -= sz
-        match_id = resp.get("matched")
-        posted_lender.append((sz, resp.get("intent_id"), match_id))
-        if match_id:
-            _try_originate_d_match(d, match_id, wallets, chain)
+        for dur in D_MAKER_DURATIONS:
+            # Skip if D already has an offer at exactly this (size, duration)
+            if any(abs(s - sz) < 0.001 and dd == dur for s, dd in d_lender_pairs):
+                continue
+            if usdc_avail < sz:
+                continue  # no deployable USDC left for this size
+            try:
+                chain.ensure_allowance(d, chain.usdc, int(sz * 1e6))  # idempotent
+            except Exception as e:
+                log(f"  D-maker: lender ${sz} approve failed: {e}")
+                continue
+            try:
+                resp = api_post_lender(
+                    d, amount_usdc=sz,
+                    min_rate_bps=floor_bps,
+                    max_duration_sec=dur,
+                    expires_at=int(time.time()) + D_INTENT_TTL_SEC,
+                )
+            except Exception as e:
+                log(f"  D-maker: lender ${sz}/{dur}s post failed: {e}")
+                continue
+            usdc_avail -= sz
+            match_id = resp.get("matched")
+            posted_lender.append((sz, resp.get("intent_id"), match_id))
+            if match_id:
+                _try_originate_d_match(d, match_id, wallets, chain)
 
     # ─── Borrower side: post tiers D doesn't have, capped by WETH ───────────
-    d_borrower_sizes = sorted(
-        round(float(b.get("principal_amount", 0)), 6)
+    d_borrower_pairs = {
+        (round(float(b.get("principal_amount", 0)), 6), int(b.get("duration_sec", 0)))
         for b in book.get("borrowers", [])
         if b.get("wallet", "").lower() == d.addr.lower()
-    )
-    weth_used = sum(s / 0.55 / eth_price * 1.10 for s in d_borrower_sizes)
+    }
+    d_borrower_sizes = sorted({a for a, _ in d_borrower_pairs})  # for the summary log below
+    weth_used = sum(a / 0.55 / eth_price * 1.10 for a, _ in d_borrower_pairs)
     weth_avail = max(0.0, bal["weth"] * 0.9 - weth_used)
     d_max_rate = floor_bps + 50
     posted_borrower = []
     for sz in D_MAKER_SIZES_USDC:
-        if any(abs(s - sz) < 0.001 for s in d_borrower_sizes):
-            continue
         collat = sz / 0.55 / eth_price * 1.10
-        if weth_avail < collat:
-            log(f"  D-maker: borrow ${sz} skipped — need {collat:.5f} WETH, only {weth_avail:.5f} deployable")
-            continue
-        try:
-            chain.ensure_allowance(d, chain.weth, int(collat * 1e18))
-            chain.ensure_allowance(d, chain.usdc, int(sz * 1.02 * 1e6))
-        except Exception as e:
-            log(f"  D-maker: borrow ${sz} approve failed: {e}")
-            continue
-        try:
-            resp = api_post_borrower(
-                d, principal=sz, collat_max=collat,
-                duration_sec=D_MAKER_DURATION_SEC,
-                max_rate_bps=d_max_rate,
-                expires_at=int(time.time()) + D_BORROW_INTENT_TTL_SEC,
-            )
-        except Exception as e:
-            log(f"  D-maker: borrow ${sz} post failed: {e}")
-            continue
-        weth_avail -= collat
-        match_id = resp.get("matched")
-        posted_borrower.append((sz, resp.get("intent_id"), match_id))
-        if match_id:
-            _try_originate_d_match(d, match_id, wallets, chain)
+        for dur in D_MAKER_DURATIONS:
+            # Skip if D already has a borrow offer at exactly this (size, duration)
+            if any(abs(s - sz) < 0.001 and dd == dur for s, dd in d_borrower_pairs):
+                continue
+            if weth_avail < collat:
+                continue  # not enough deployable WETH for this size
+            try:
+                chain.ensure_allowance(d, chain.weth, int(collat * 1e18))   # idempotent
+                chain.ensure_allowance(d, chain.usdc, int(sz * 1.02 * 1e6))
+            except Exception as e:
+                log(f"  D-maker: borrow ${sz} approve failed: {e}")
+                continue
+            try:
+                resp = api_post_borrower(
+                    d, principal=sz, collat_max=collat,
+                    duration_sec=dur,
+                    max_rate_bps=d_max_rate,
+                    expires_at=int(time.time()) + D_BORROW_INTENT_TTL_SEC,
+                )
+            except Exception as e:
+                log(f"  D-maker: borrow ${sz}/{dur}s post failed: {e}")
+                continue
+            weth_avail -= collat
+            match_id = resp.get("matched")
+            posted_borrower.append((sz, resp.get("intent_id"), match_id))
+            if match_id:
+                _try_originate_d_match(d, match_id, wallets, chain)
 
     # Summary log
     if posted_lender or posted_borrower:
@@ -1341,6 +1345,67 @@ def _try_default(loan: dict, wallets: list[Wallet], chain: Chain, state: dict) -
     state_save(state)
 
 
+# ─── Lender-side recovery ────────────────────────────────────────────────────
+
+MAX_LENDER_CLAIMS_PER_FIRE = 3   # cap per fire; remaining zombies wait for next tick
+
+
+def claim_lender_side_defaults(wallets: list[Wallet], chain: Chain) -> None:
+    """Self-healing (LENDER side): when WE lent and an EXTERNAL borrower ran the
+    loan past expiry without repaying, the collateral is ours to recover — but
+    until now nothing claimed it. reconcile_external_loans() only adopts
+    borrower-side loans (those WE owe) and act_repay() only repays/defaults
+    those; lender-side defaults silently piled up.
+    (Gap found 2026-06-02: loan 0x771d498c… sat ~7.5h unclaimed until a manual
+    defaultLoan via default_one.py.)
+
+    Sweep the registry for active-but-past-expiry loans where lender ∈ our
+    wallets and the borrower is external; verify on-chain (loans() getter is the
+    source of truth — never trust the API for a settle decision); then call
+    defaultLoan(). The Aave-style split returns debt-equivalent collateral to us
+    (the lender) + a 3% bounty to the caller (also us). This is the in-cycle
+    version of the one-off default_one.py. Capped per fire to avoid nonce floods."""
+    our = {w.addr.lower(): w for w in wallets}
+    try:
+        registry = api_active_loans()
+    except Exception as e:
+        log(f"  lender-claim: registry fetch failed ({type(e).__name__}) — skip this fire")
+        return
+    now_ts = int(time.time())
+    state = state_load()
+    claimed = 0
+    for rec in registry:
+        if claimed >= MAX_LENDER_CLAIMS_PER_FIRE:
+            break
+        lid = rec.get("loan_id")
+        if not lid:
+            continue
+        # Only loans where WE are the lender and the borrower is EXTERNAL.
+        if (rec.get("lender") or "").lower() not in our:
+            continue
+        if (rec.get("borrower") or "").lower() in our:
+            continue  # internal↔internal default is handled on the borrower side
+        # Chain is source of truth.
+        try:
+            ln = chain.repo.functions.loans(bytes.fromhex(lid[2:])).call()
+        except Exception:
+            continue
+        lender = ln[1].lower()
+        expiry = int(ln[7])
+        repaid, defaulted, liquidated = ln[9], ln[10], ln[11]
+        if lender not in our or repaid or defaulted or liquidated:
+            continue          # not ours on-chain, or already closed
+        if now_ts <= expiry:
+            continue          # not past expiry yet — defaultLoan would revert
+        log(f"  ⚠ LENDER-CLAIM: loan {lid[:14]}… lender={our[lender].name} "
+            f"borrower=EXTERNAL principal≈${int(ln[3])/1e6:.4f}, "
+            f"{now_ts - expiry}s past expiry → defaultLoan() to recover collateral")
+        _try_default({"loan_id": lid}, wallets, chain, state)
+        claimed += 1
+    if claimed:
+        log(f"  lender-claim: settled {claimed} defaulted lender-side loan(s) this fire")
+
+
 # ─── Main ────────────────────────────────────────────────────────────────────
 
 def main() -> int:
@@ -1399,6 +1464,14 @@ def main() -> int:
         reconcile_external_loans(wallets, chain)
     except Exception as e:
         log(f"  ✗ reconcile errored: {e}")
+
+    # Lender side of the same coin: settle loans WE funded where an external
+    # borrower defaulted (ran past expiry unrepaid). reconcile above only adopts
+    # borrower-side loans, so without this these collateral claims sit forever.
+    try:
+        claim_lender_side_defaults(wallets, chain)
+    except Exception as e:
+        log(f"  ✗ lender-claim errored: {e}")
 
     # Always opportunistically repay first if anything is due
     state = state_load()
