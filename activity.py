@@ -251,13 +251,18 @@ class Chain:
         }
 
     def send(self, account, fn, gas: int = 200_000) -> str:
+        # Adaptive fee: a fixed 0.25 gwei ceiling stalled txs whenever Base
+        # base-fee spiked (→ "not in chain after 90s" → missed repay → default,
+        # 2026-06-05). Scale the ceiling with the live base-fee so txs still mine
+        # under congestion; pending-nonce avoids races on back-to-back sends.
+        prio = self.w3.to_wei(0.15, "gwei")
         tx = fn.build_transaction({
             "from":  account.address,
-            "nonce": self.w3.eth.get_transaction_count(account.address),
+            "nonce": self.w3.eth.get_transaction_count(account.address, "pending"),
             "chainId": CHAIN_ID,
             "gas":   gas,
-            "maxPriorityFeePerGas": self.w3.to_wei(0.1, "gwei"),
-            "maxFeePerGas":         self.w3.to_wei(0.25, "gwei"),
+            "maxPriorityFeePerGas": prio,
+            "maxFeePerGas":         self.w3.eth.gas_price * 5 + prio,
         })
         signed = account.sign_transaction(tx)
         raw = signed.raw_transaction if hasattr(signed, "raw_transaction") else signed.rawTransaction
