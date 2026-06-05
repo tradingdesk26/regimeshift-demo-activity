@@ -482,7 +482,13 @@ def api_fetch_match(match_id: str) -> dict | None:
 
 
 def api_active_loans() -> list[dict]:
-    r = requests.get(f"{API_BASE}/v1/loans/registry?limit=30", timeout=15)
+    # limit must comfortably exceed all loans created during any active loan's
+    # lifetime (<=1h) — else an externally-originated loan we owe scrolls out of
+    # the window before reconcile_external_loans adopts it and we drift to
+    # default (incident 2026-06-05: a runner-originated $1 loan defaulted because
+    # limit=30 was too small). Active loans are always recent, so a large recent
+    # window captures every one.
+    r = requests.get(f"{API_BASE}/v1/loans/registry?limit=400", timeout=15)
     r.raise_for_status()
     return [l for l in r.json().get("loans", []) if l["status"] == "active"]
 
