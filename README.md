@@ -92,8 +92,8 @@ tail -f /opt/regimeshift-demo/activity.log
 
 - [`armsys-signals`](https://github.com/tradingdesk26/armsys-signals) — the
   API server this bot consumes (paid x402 endpoints, two-tier facilitator)
-- [`regimeshift-clearinghouse`](https://github.com/tradingdesk26/regimeshift-clearinghouse) — InterAgentRepoV4 on-chain escrow contracts (the bot originates/repays here)
-- [`regimeshift-agent-starter`](https://github.com/tradingdesk26/regimeshift-agent-starter) — minimal starter kit if you want to build your own agent
+- [`regimeshift-clearinghouse`](https://github.com/regimeshift-xyz/regimeshift-clearinghouse) — InterAgentRepoV4 on-chain escrow contracts (the bot originates/repays here)
+- [`regimeshift-agent-starter`](https://github.com/regimeshift-xyz/regimeshift-agent-starter) — minimal starter kit if you want to build your own agent
 
 ## Operational playbooks (in this repo)
 
